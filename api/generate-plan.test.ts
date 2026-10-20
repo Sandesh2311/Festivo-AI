@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import handler from './generate-plan'
-import type { Request, Response } from './_shared'
+import type { Request, Response } from './_shared.js'
 
 function responseMock() {
   const state: { code: number; body?: unknown; headers: Record<string,string> } = { code: 200, headers: {} }

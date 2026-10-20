@@ -1,4 +1,4 @@
-import { allowRate, failed, generate, type Request, type Response } from './_shared'
+import { allowRate, failed, generate, type Request, type Response } from './_shared.js'
 import { z } from 'zod'
 const inputSchema = z.object({ event: z.record(z.unknown()), question: z.string().trim().min(4).max(500) })
 const outputSchema = z.object({ answer: z.string().min(20).max(1500) })

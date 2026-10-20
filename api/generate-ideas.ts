@@ -1,4 +1,4 @@
-import { failed, generate, guard, type Request, type Response } from './_shared'
+import { failed, generate, guard, type Request, type Response } from './_shared.js'
 import { z } from 'zod'
 const schema = z.object({ ideas: z.array(z.string().min(8).max(500)).min(3).max(6) })
 export default async function handler(req: Request, res: Response) {
