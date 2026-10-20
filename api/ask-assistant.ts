@@ -10,5 +10,5 @@ export default async function handler(req: Request, res: Response) {
   if (!allowRate(req, res)) return
   const parsed = inputSchema.safeParse(req.body)
   if (!parsed.success) { res.status(400).json({ error: 'Please add a short question.' }); return }
-  try { const output = await generate(`You are a careful event planning assistant. Answer the user's question practically, using their event details when relevant. Do not make up quotes, bookings, supplier availability, legal advice, or current local facts. Mention trade-offs and clear next steps. Keep the answer concise and state costs are estimates. Event context: ${JSON.stringify(parsed.data.event)}\nQuestion: ${parsed.data.question}`, outputSchema); res.status(200).json(output) } catch (error) { failed(res,error) }
+  try { const output = await generate(`You are a careful event planning assistant. Answer the user's question practically, using their event details when relevant. Do not make up quotes, bookings, supplier availability, legal advice, or current local facts. Mention trade-offs and clear next steps. Keep the answer concise and state costs are estimates. Event context: ${JSON.stringify(parsed.data.event)}\nQuestion: ${parsed.data.question}`, outputSchema, 'ask-assistant'); res.status(200).json(output) } catch (error) { failed(res,error) }
 }

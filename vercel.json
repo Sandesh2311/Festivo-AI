@@ -1,1 +1,1 @@
-{"framework":"vite"}
+{"framework":"vite","functions":{"api/*.ts":{"maxDuration":25}}}

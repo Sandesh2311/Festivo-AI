@@ -13,7 +13,7 @@ function responseMock() {
 }
 const body = { type:'Birthday',title:'Maya’s birthday',date:'2027-06-20',location:'Pune',guests:40,days:1,budget:20000,currency:'INR',flexibility:'Fixed',theme:'Garden picnic',setting:'Outdoor',food:'Vegetarian',personal:'',formality:'Relaxed',priority:'Budget',ageGroup:'Children',accessibility:'',special:'',contingency:'' }
 
-afterEach(() => { delete process.env.GEMINI_API_KEY; vi.unstubAllGlobals() })
+afterEach(() => { delete process.env.GEMINI_API_KEY; vi.unstubAllGlobals(); vi.useRealTimers(); vi.restoreAllMocks() })
 describe('Vercel plan route guards', () => {
   it('rejects methods other than POST', async () => {
     const { response, state } = responseMock()
@@ -55,5 +55,39 @@ describe('Vercel plan route guards', () => {
     await handler({ method:'POST', headers:{'x-forwarded-for':'test-invalid-model'}, body } as Request, response)
     expect(state.code).toBe(502)
     expect(state.body).toEqual({ error:'The planning assistant could not return a valid answer' })
+  })
+  it('returns a safe timeout after one bounded upstream request', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    vi.useFakeTimers()
+    const fetchMock = vi.fn(() => new Promise<Response>(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { response, state } = responseMock()
+    const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-timeout'}, body } as Request, response)
+    await vi.advanceTimersByTimeAsync(18_000)
+    await pending
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(state.code).toBe(504)
+    expect(state.body).toEqual({ error:'The planning service timed out. Please try again.' })
+    expect(JSON.stringify(log.mock.calls)).not.toContain('test-only-key')
+    expect(JSON.stringify(log.mock.calls)).not.toContain('Garden picnic')
+  })
+  it('maps non-2xx Gemini responses to a safe upstream error', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok:false, status:503, text:async () => 'sensitive provider details' }))
+    const { response, state } = responseMock()
+    await handler({ method:'POST', headers:{'x-forwarded-for':'test-upstream-error'}, body } as Request, response)
+    expect(state.code).toBe(502)
+    expect(state.body).toEqual({ error:'The planning assistant could not return a valid answer' })
+    expect(JSON.stringify(state.body)).not.toContain('sensitive provider details')
+  })
+  it('handles a malformed Gemini HTTP response body safely', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok:true, status:200, json:async () => { throw new SyntaxError('private response body') } }))
+    const { response, state } = responseMock()
+    await handler({ method:'POST', headers:{'x-forwarded-for':'test-malformed-body'}, body } as Request, response)
+    expect(state.code).toBe(502)
+    expect(state.body).toEqual({ error:'The planning assistant could not return a valid answer' })
+    expect(JSON.stringify(state.body)).not.toContain('private response body')
   })
 })
