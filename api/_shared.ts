@@ -27,12 +27,32 @@ export function guard(req: Request, res: Response): Input | null {
 }
 const GEMINI_MODEL = 'gemini-3.8-flash'
 const GEMINI_TIMEOUT_MS = 18_000
+const ERROR_MESSAGE_LIMIT = 240
+
+function sanitizeProviderMessage(message: unknown, key: string, prompt: string): string | undefined {
+  if (typeof message !== 'string') return undefined
+  const sanitized = message
+    .replaceAll(prompt, '[REDACTED_PROMPT]')
+    .replaceAll(key, '[REDACTED_KEY]')
+    .replace(/AIza[\w-]{20,}/g, '[REDACTED_KEY]')
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [REDACTED]')
+    .trim()
+  const withoutControls = Array.from(sanitized, character => {
+    const code = character.charCodeAt(0)
+    return code < 32 || code === 127 ? ' ' : character
+  }).join('')
+  return withoutControls.slice(0, ERROR_MESSAGE_LIMIT) || undefined
+}
 
 export async function generate(prompt: string, schema: z.ZodTypeAny, route = 'unknown'): Promise<unknown> {
-  const key = process.env.GEMINI_API_KEY
-  if (!key) throw Object.assign(new Error('AI is not configured'), { code: 'MISSING_KEY' })
   const requestId = randomUUID()
   const startedAt = Date.now()
+  const key = process.env.GEMINI_API_KEY
+  if (!key) {
+    const error = Object.assign(new Error('AI is not configured'), { code: 'MISSING_KEY', category: 'configuration' })
+    console.error(JSON.stringify({ event: 'gemini.failure', route, requestId, stage: 'configuration', category: 'configuration', elapsedMs: 0 }))
+    throw error
+  }
   let stage = 'request'
   const controller = new AbortController()
   let timeout: ReturnType<typeof setTimeout> | undefined
@@ -40,7 +60,7 @@ export async function generate(prompt: string, schema: z.ZodTypeAny, route = 'un
   const timedOut = new Promise<never>((_, reject) => {
     timeout = setTimeout(() => {
       controller.abort()
-      reject(Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT' }))
+      reject(Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT', category: 'timeout' }))
     }, GEMINI_TIMEOUT_MS)
   })
   const operation = async () => {
@@ -49,38 +69,50 @@ export async function generate(prompt: string, schema: z.ZodTypeAny, route = 'un
     try {
       response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.65, maxOutputTokens: 1800 } }), signal: controller.signal,
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 1800 } }), signal: controller.signal,
       })
     } catch {
-      if (controller.signal.aborted) throw Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT' })
-      throw Object.assign(new Error('Provider network error'), { code: 'NETWORK' })
+      if (controller.signal.aborted) throw Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT', category: 'timeout' })
+      throw Object.assign(new Error('Provider network error'), { code: 'NETWORK', category: 'network' })
     }
     console.info(JSON.stringify({ event: 'gemini.response', route, requestId, status: response.status, elapsedMs: Date.now() - startedAt }))
-    if (!response.ok) throw Object.assign(new Error('Provider response error'), { status: response.status })
+    if (!response.ok) {
+      let googleError: { error?: { code?: number | string; message?: string } } | undefined
+      try { googleError = await response.json() as typeof googleError } catch { /* Google may return a non-JSON error body. */ }
+      throw Object.assign(new Error('Provider response error'), {
+        code: 'UPSTREAM_HTTP', category: 'upstream_http', status: response.status,
+        googleCode: googleError?.error?.code,
+        googleMessage: sanitizeProviderMessage(googleError?.error?.message, key, prompt),
+      })
+    }
     stage = 'response_parse'
     let payload: unknown
-    try { payload = await response.json() } catch { throw Object.assign(new Error('Invalid model response'), { code: 'INVALID_RESPONSE' }) }
+    try { payload = await response.json() } catch { throw Object.assign(new Error('Invalid model response'), { code: 'INVALID_RESPONSE', category: 'malformed_response' }) }
     const parts = (payload as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> })?.candidates?.[0]?.content?.parts
     const raw = parts?.map(part => part.text ?? '').join('')
-    if (!raw) throw Object.assign(new Error('Empty model response'), { code: 'INVALID_RESPONSE' })
-    try { return schema.parse(JSON.parse(raw)) } catch { throw Object.assign(new Error('Invalid model response'), { code: 'INVALID_RESPONSE' }) }
+    if (!raw) throw Object.assign(new Error('Empty model response'), { code: 'INVALID_RESPONSE', category: 'malformed_response' })
+    try { return schema.parse(JSON.parse(raw)) } catch { throw Object.assign(new Error('Invalid model response'), { code: 'INVALID_RESPONSE', category: 'malformed_response' }) }
   }
   try {
     const result = await Promise.race([operation(), timedOut])
     console.info(JSON.stringify({ event: 'gemini.success', route, requestId, elapsedMs: Date.now() - startedAt }))
     return result
   } catch (error) {
-    const details = error as { code?: string; status?: number }
-    const code = details?.code || (details?.status ? 'UPSTREAM_ERROR' : 'UNKNOWN')
-    console.error(JSON.stringify({ event: 'gemini.failure', route, requestId, stage, code, status: details?.status, elapsedMs: Date.now() - startedAt }))
+    const details = error as { code?: string; category?: string; status?: number; googleCode?: number | string; googleMessage?: string }
+    const category = details?.category || 'unexpected'
+    console.error(JSON.stringify({ event: 'gemini.failure', route, requestId, stage, category, code: details?.code, status: details?.status, googleCode: details?.googleCode, googleMessage: details?.googleMessage, elapsedMs: Date.now() - startedAt }))
     throw error
   } finally { if (timeout) clearTimeout(timeout) }
 }
 export function failed(res: Response, error: unknown) {
-  const code = (error as {code?:string})?.code
-  if (code === 'MISSING_KEY') { res.status(503).json({ error: 'AI is not configured' }); return }
-  if (code === 'TIMEOUT') { res.status(504).json({ error: 'The planning service timed out. Please try again.' }); return }
-  if (code === 'NETWORK') { res.status(502).json({ error: 'The planning service could not be reached. Please try again.' }); return }
-  if ((error as {status?:number})?.status === 429) { res.status(429).json({ error: 'The planning assistant is busy' }); return }
-  res.status(502).json({ error: 'The planning assistant could not return a valid answer' })
+  const details = error as { category?: string; status?: number }
+  const category = details?.category || 'unexpected'
+  if (category === 'configuration') { res.status(503).json({ error: 'AI generation is not configured on the server.' }); return }
+  if (category === 'timeout') { res.status(504).json({ error: 'The planning service timed out. Please try again.' }); return }
+  if (category === 'network') { res.status(502).json({ error: 'The planning service could not be reached. Please try again.' }); return }
+  if (category === 'upstream_http' && details.status === 429) { res.status(429).json({ error: 'The planning assistant is busy. Please try again shortly.' }); return }
+  if (category === 'upstream_http' && (details.status === 401 || details.status === 403)) { res.status(503).json({ error: 'The AI service is not authorized. Please contact support.' }); return }
+  if (category === 'upstream_http') { res.status(502).json({ error: 'The AI service rejected the request. Please try again later.' }); return }
+  if (category === 'malformed_response') { res.status(502).json({ error: 'The planning assistant returned an invalid answer. Please try again.' }); return }
+  res.status(500).json({ error: 'The planning assistant encountered an unexpected error.' })
 }

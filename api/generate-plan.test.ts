@@ -29,7 +29,7 @@ describe('Vercel plan route guards', () => {
     const { response, state } = responseMock()
     await handler({ method:'POST', headers:{}, body } as Request, response)
     expect(state.code).toBe(503)
-    expect(state.body).toEqual({ error:'AI is not configured' })
+    expect(state.body).toEqual({ error:'AI generation is not configured on the server.' })
     expect(JSON.stringify(state.body)).not.toContain('GEMINI_API_KEY')
   })
   it('validates and returns a successful structured Gemini response', async () => {
@@ -42,6 +42,8 @@ describe('Vercel plan route guards', () => {
     expect(state.code).toBe(200)
     expect((state.body as {plan:{summary:string}}).plan.summary).toContain('40 guest birthday')
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ method:'POST' })
+    expect(fetchMock.mock.calls[0][0]).toBe('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent')
+    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string).generationConfig).not.toHaveProperty('temperature')
   })
   it('rejects requests larger than the server limit', async () => {
     const { response, state } = responseMock()
@@ -54,7 +56,7 @@ describe('Vercel plan route guards', () => {
     const { response, state } = responseMock()
     await handler({ method:'POST', headers:{'x-forwarded-for':'test-invalid-model'}, body } as Request, response)
     expect(state.code).toBe(502)
-    expect(state.body).toEqual({ error:'The planning assistant could not return a valid answer' })
+    expect(state.body).toEqual({ error:'The planning assistant returned an invalid answer. Please try again.' })
   })
   it('returns a safe timeout after one bounded upstream request', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'
@@ -74,11 +76,11 @@ describe('Vercel plan route guards', () => {
   })
   it('maps non-2xx Gemini responses to a safe upstream error', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok:false, status:503, text:async () => 'sensitive provider details' }))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok:false, status:503, json:async () => ({ error:{ code:503, message:'sensitive provider details' } }) }))
     const { response, state } = responseMock()
     await handler({ method:'POST', headers:{'x-forwarded-for':'test-upstream-error'}, body } as Request, response)
     expect(state.code).toBe(502)
-    expect(state.body).toEqual({ error:'The planning assistant could not return a valid answer' })
+    expect(state.body).toEqual({ error:'The AI service rejected the request. Please try again later.' })
     expect(JSON.stringify(state.body)).not.toContain('sensitive provider details')
   })
   it('handles a malformed Gemini HTTP response body safely', async () => {
@@ -87,7 +89,39 @@ describe('Vercel plan route guards', () => {
     const { response, state } = responseMock()
     await handler({ method:'POST', headers:{'x-forwarded-for':'test-malformed-body'}, body } as Request, response)
     expect(state.code).toBe(502)
-    expect(state.body).toEqual({ error:'The planning assistant could not return a valid answer' })
+    expect(state.body).toEqual({ error:'The planning assistant returned an invalid answer. Please try again.' })
     expect(JSON.stringify(state.body)).not.toContain('private response body')
+  })
+  it('logs bounded Google error details without logging credentials or prompts', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok:false, status:400, json:async () => ({ error:{ code:400, message:`Invalid API key test-only-key; ${'x'.repeat(400)}` } }) }))
+    const { response, state } = responseMock()
+    await handler({ method:'POST', headers:{'x-forwarded-for':'test-diagnostics'}, body } as Request, response)
+    const failure = JSON.parse(log.mock.calls.map(call => String(call[0])).find(line => line.includes('gemini.failure')) as string)
+    expect(failure).toMatchObject({ category:'upstream_http', status:400, googleCode:400, route:'generate-plan' })
+    expect(failure.elapsedMs).toEqual(expect.any(Number))
+    expect(failure.googleMessage.length).toBeLessThanOrEqual(240)
+    expect(failure.googleMessage).toContain('[REDACTED_KEY]')
+    expect(JSON.stringify(failure)).not.toContain('test-only-key')
+    expect(JSON.stringify(failure)).not.toContain('Maya')
+    expect(state.code).toBe(502)
+  })
+  it('classifies network failures separately', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('network down')))
+    const { response, state } = responseMock()
+    await handler({ method:'POST', headers:{'x-forwarded-for':'test-network'}, body } as Request, response)
+    expect(state.code).toBe(502)
+    expect(state.body).toEqual({ error:'The planning service could not be reached. Please try again.' })
+  })
+  it('classifies unexpected upstream handling exceptions separately', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    const brokenResponse = { status:200, get ok(): boolean { throw new Error('unexpected internal detail') } }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(brokenResponse))
+    const { response, state } = responseMock()
+    await handler({ method:'POST', headers:{'x-forwarded-for':'test-unexpected'}, body } as Request, response)
+    expect(state.code).toBe(500)
+    expect(state.body).toEqual({ error:'The planning assistant encountered an unexpected error.' })
   })
 })
