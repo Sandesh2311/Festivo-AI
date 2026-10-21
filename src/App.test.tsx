@@ -26,6 +26,18 @@ describe('planning workflow', () => {
     expect(screen.getByText('Venue')).toBeInTheDocument()
   })
 
+  it('shows the temporary Gemini outage message while keeping the local guide labelled', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok:false, status:503, json:async () => ({ error:'The planning assistant is temporarily unavailable. Please try again shortly.' }) }))
+    render(<App />)
+    fireEvent.click(screen.getByRole('button', { name: /plan your celebration/i }))
+    fireEvent.change(screen.getByLabelText('Event name'), { target: { value: 'Maya birthday' } })
+    fireEvent.change(screen.getByLabelText('Event date'), { target: { value: '2027-06-20' } })
+    fireEvent.click(screen.getByRole('button', { name: /create my event plan/i }))
+    expect(await screen.findByText(/temporarily unavailable.*local planning guide/i)).toBeInTheDocument()
+    expect(screen.getByText(/local planning guide/i)).toBeInTheDocument()
+    expect(screen.getByText('Maya birthday')).toBeInTheDocument()
+  })
+
   it('offers a clearly labelled sample, then tracks checklist progress', () => {
     render(<App />)
     fireEvent.click(screen.getByRole('button', { name: /explore sample plan/i }))

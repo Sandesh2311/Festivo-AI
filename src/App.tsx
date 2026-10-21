@@ -26,7 +26,15 @@ function App() {
     setErrors({}); setLoading(true); setMessage('Building your plan around your details…')
     try {
       const response = await fetch('/api/generate-plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(event) })
-      if (!response.ok) throw new Error(response.status === 429 ? 'The assistant is busy. Showing a local planning guide for now.' : 'Live AI is unavailable. Showing a local planning guide for now.')
+      if (!response.ok) {
+        if (response.status === 429) throw new Error('The assistant is busy. Showing a local planning guide for now.')
+        if (response.status === 503) {
+          let serverMessage: string | undefined
+          try { serverMessage = (await response.json() as { error?: string }).error } catch { /* Use the local safe fallback message. */ }
+          throw new Error(`${serverMessage || 'The planning assistant is temporarily unavailable.'} Showing a local planning guide for now.`)
+        }
+        throw new Error('Live AI is unavailable. Showing a local planning guide for now.')
+      }
       const data = await response.json() as { plan?: Plan; source?: string }
       if (!data.plan?.summary) throw new Error('The response was incomplete. Showing a local planning guide for now.')
       setPlan(data.plan); setSource('AI generated'); setMessage('Your personalized plan is ready. AI suggestions are estimates, not confirmed bookings.')

@@ -134,7 +134,8 @@ describe('Vercel plan route guards', () => {
     await vi.advanceTimersByTimeAsync(250)
     await pending
     expect(fetchMock).toHaveBeenCalledTimes(3)
-    expect(state.code).toBe(502)
+    expect(state.code).toBe(503)
+    expect(state.body).toEqual({ error:'The planning assistant is temporarily unavailable. Please try again shortly.' })
     const events = timingLog.mock.calls.map(call => String(call[0])).join('\n')
     expect(events).toContain('"reason":"retry_limit"')
     expect(events).toContain('"waitMs":125')
@@ -153,7 +154,7 @@ describe('Vercel plan route guards', () => {
     resolveFirst(httpResponse(503, { error:{ code:503, message:'temporary overload' } }))
     await pending
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(state.code).toBe(502)
+    expect(state.code).toBe(503)
     expect(timingLog.mock.calls.map(call => String(call[0])).join('\n')).toContain('"reason":"deadline"')
   })
   it('keeps the original deadline after a retry instead of granting a fresh timeout', async () => {

@@ -168,6 +168,7 @@ export function failed(res: Response, error: unknown) {
   if (category === 'network') { res.status(502).json({ error: 'The planning service could not be reached. Please try again.' }); return }
   if (category === 'upstream_http' && details.status === 429) { res.status(429).json({ error: 'The planning assistant is busy. Please try again shortly.' }); return }
   if (category === 'upstream_http' && (details.status === 401 || details.status === 403)) { res.status(503).json({ error: 'The AI service is not authorized. Please contact support.' }); return }
+  if (category === 'upstream_http' && details.status === 503) { res.status(503).json({ error: 'The planning assistant is temporarily unavailable. Please try again shortly.' }); return }
   if (category === 'upstream_http') { res.status(502).json({ error: 'The AI service rejected the request. Please try again later.' }); return }
   if (category === 'malformed_response') { res.status(502).json({ error: 'The planning assistant returned an invalid answer. Please try again.' }); return }
   res.status(500).json({ error: 'The planning assistant encountered an unexpected error.' })
