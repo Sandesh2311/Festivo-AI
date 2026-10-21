@@ -27,6 +27,7 @@ export function guard(req: Request, res: Response): Input | null {
 }
 const GEMINI_MODEL = 'gemini-3.8-flash'
 const GEMINI_TIMEOUT_MS = 18_000
+const GEMINI_MAX_OUTPUT_TOKENS = 1000
 const ERROR_MESSAGE_LIMIT = 240
 
 function sanitizeProviderMessage(message: unknown, key: string, prompt: string): string | undefined {
@@ -66,16 +67,19 @@ export async function generate(prompt: string, schema: z.ZodTypeAny, route = 'un
   const operation = async () => {
     stage = 'upstream_request'
     let response: globalThis.Response
+    const requestStartedAt = Date.now()
+    console.info(JSON.stringify({ event: 'gemini.request_start', route, requestId, elapsedMs: requestStartedAt - startedAt }))
     try {
       response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 1800 } }), signal: controller.signal,
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS } }), signal: controller.signal,
       })
     } catch {
       if (controller.signal.aborted) throw Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT', category: 'timeout' })
       throw Object.assign(new Error('Provider network error'), { code: 'NETWORK', category: 'network' })
     }
-    console.info(JSON.stringify({ event: 'gemini.response', route, requestId, status: response.status, elapsedMs: Date.now() - startedAt }))
+    const responseAt = Date.now()
+    console.info(JSON.stringify({ event: 'gemini.upstream_response', route, requestId, status: response.status, requestDurationMs: responseAt - requestStartedAt, elapsedMs: responseAt - startedAt }))
     if (!response.ok) {
       let googleError: { error?: { code?: number | string; message?: string } } | undefined
       try { googleError = await response.json() as typeof googleError } catch { /* Google may return a non-JSON error body. */ }
@@ -86,21 +90,36 @@ export async function generate(prompt: string, schema: z.ZodTypeAny, route = 'un
       })
     }
     stage = 'response_parse'
+    const responseParseStartedAt = Date.now()
+    console.info(JSON.stringify({ event: 'gemini.response_parse_start', route, requestId, elapsedMs: responseParseStartedAt - startedAt }))
     let payload: unknown
-    try { payload = await response.json() } catch { throw Object.assign(new Error('Invalid model response'), { code: 'INVALID_RESPONSE', category: 'malformed_response' }) }
+    try { payload = await response.json() } catch {
+      console.info(JSON.stringify({ event: 'gemini.response_parse_end', route, requestId, outcome: 'invalid_json', parseDurationMs: Date.now() - responseParseStartedAt, elapsedMs: Date.now() - startedAt }))
+      throw Object.assign(new Error('Invalid model response'), { code: 'INVALID_RESPONSE', category: 'malformed_response' })
+    }
     const parts = (payload as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> })?.candidates?.[0]?.content?.parts
     const raw = parts?.map(part => part.text ?? '').join('')
-    if (!raw) throw Object.assign(new Error('Empty model response'), { code: 'INVALID_RESPONSE', category: 'malformed_response' })
-    try { return schema.parse(JSON.parse(raw)) } catch { throw Object.assign(new Error('Invalid model response'), { code: 'INVALID_RESPONSE', category: 'malformed_response' }) }
+    if (!raw) {
+      console.info(JSON.stringify({ event: 'gemini.response_parse_end', route, requestId, outcome: 'empty_content', parseDurationMs: Date.now() - responseParseStartedAt, elapsedMs: Date.now() - startedAt }))
+      throw Object.assign(new Error('Empty model response'), { code: 'INVALID_RESPONSE', category: 'malformed_response' })
+    }
+    try {
+      const result = schema.parse(JSON.parse(raw))
+      console.info(JSON.stringify({ event: 'gemini.response_parse_end', route, requestId, outcome: 'success', parseDurationMs: Date.now() - responseParseStartedAt, elapsedMs: Date.now() - startedAt }))
+      return result
+    } catch {
+      console.info(JSON.stringify({ event: 'gemini.response_parse_end', route, requestId, outcome: 'invalid_content', parseDurationMs: Date.now() - responseParseStartedAt, elapsedMs: Date.now() - startedAt }))
+      throw Object.assign(new Error('Invalid model response'), { code: 'INVALID_RESPONSE', category: 'malformed_response' })
+    }
   }
   try {
     const result = await Promise.race([operation(), timedOut])
-    console.info(JSON.stringify({ event: 'gemini.success', route, requestId, elapsedMs: Date.now() - startedAt }))
+    console.info(JSON.stringify({ event: 'gemini.success', route, requestId, totalDurationMs: Date.now() - startedAt }))
     return result
   } catch (error) {
     const details = error as { code?: string; category?: string; status?: number; googleCode?: number | string; googleMessage?: string }
     const category = details?.category || 'unexpected'
-    console.error(JSON.stringify({ event: 'gemini.failure', route, requestId, stage, category, code: details?.code, status: details?.status, googleCode: details?.googleCode, googleMessage: details?.googleMessage, elapsedMs: Date.now() - startedAt }))
+    console.error(JSON.stringify({ event: 'gemini.failure', route, requestId, stage, category, code: details?.code, status: details?.status, googleCode: details?.googleCode, googleMessage: details?.googleMessage, totalDurationMs: Date.now() - startedAt }))
     throw error
   } finally { if (timeout) clearTimeout(timeout) }
 }
