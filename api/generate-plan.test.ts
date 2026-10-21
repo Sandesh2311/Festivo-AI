@@ -65,7 +65,9 @@ describe('Vercel plan route guards', () => {
   it('returns a safe timeout after one bounded upstream request', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'
     vi.useFakeTimers()
-    const fetchMock = vi.fn(() => new Promise<Response>(() => {}))
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once:true })
+    }))
     vi.stubGlobal('fetch', fetchMock)
     const log = vi.spyOn(console, 'error').mockImplementation(() => {})
     const timingLog = vi.spyOn(console, 'info').mockImplementation(() => {})
@@ -74,12 +76,15 @@ describe('Vercel plan route guards', () => {
     await vi.advanceTimersByTimeAsync(18_000)
     await pending
     expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect((fetchMock.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true)
     expect(state.code).toBe(504)
     expect(state.body).toEqual({ error:'The planning service timed out. Please try again.' })
     expect(JSON.stringify(log.mock.calls)).not.toContain('test-only-key')
     expect(JSON.stringify(log.mock.calls)).not.toContain('Garden picnic')
     expect(JSON.stringify(timingLog.mock.calls)).toContain('gemini.request_start')
     expect(JSON.stringify(log.mock.calls)).toContain('totalDurationMs')
+    expect(JSON.stringify(log.mock.calls)).toContain('gemini.deadline_abort')
+    expect(JSON.stringify(log.mock.calls)).toContain('application_deadline')
   })
   it('maps non-2xx Gemini responses to a safe upstream error', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'
@@ -151,6 +156,27 @@ describe('Vercel plan route guards', () => {
     expect(state.code).toBe(502)
     expect(timingLog.mock.calls.map(call => String(call[0])).join('\n')).toContain('"reason":"deadline"')
   })
+  it('keeps the original deadline after a retry instead of granting a fresh timeout', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    vi.useFakeTimers()
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(httpResponse(503, { error:{ code:503, message:'temporary overload' } }, '17'))
+      .mockImplementationOnce((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once:true })
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { response, state } = responseMock()
+    const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-retry-total-deadline'}, body } as Request, response)
+    await vi.advanceTimersByTimeAsync(17_000)
+    await vi.advanceTimersByTimeAsync(1_000)
+    await pending
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect((fetchMock.mock.calls[1][1] as RequestInit).signal?.aborted).toBe(true)
+    expect(state.code).toBe(504)
+    const deadlineEvent = log.mock.calls.map(call => JSON.parse(String(call[0]))).find(event => event.event === 'gemini.deadline_abort')
+    expect(deadlineEvent).toMatchObject({ attempt:2, failureCategory:'application_deadline', elapsedMs:18_000 })
+  })
   it.each([401, 403])('does not retry non-retryable HTTP %i responses', async status => {
     process.env.GEMINI_API_KEY = 'test-only-key'
     const fetchMock = vi.fn().mockResolvedValue(httpResponse(status, { error:{ code:status, message:'not authorized' } }))
@@ -192,10 +218,13 @@ describe('Vercel plan route guards', () => {
   it('classifies network failures separately', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('network down')))
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
     const { response, state } = responseMock()
     await handler({ method:'POST', headers:{'x-forwarded-for':'test-network'}, body } as Request, response)
     expect(state.code).toBe(502)
     expect(state.body).toEqual({ error:'The planning service could not be reached. Please try again.' })
+    const fetchFailure = log.mock.calls.map(call => JSON.parse(String(call[0]))).find(event => event.event === 'gemini.fetch_rejected')
+    expect(fetchFailure).toMatchObject({ attempt:1, failureCategory:'network' })
   })
   it('classifies unexpected upstream handling exceptions separately', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'

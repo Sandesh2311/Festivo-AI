@@ -68,18 +68,19 @@ export async function generate(prompt: string, schema: z.ZodTypeAny, route = 'un
     throw error
   }
   let stage = 'request'
+  let attempt = 0
   const controller = new AbortController()
   let timeout: ReturnType<typeof setTimeout> | undefined
   console.info(JSON.stringify({ event: 'gemini.start', route, requestId, model: GEMINI_MODEL }))
   const timedOut = new Promise<never>((_, reject) => {
     timeout = setTimeout(() => {
+      console.error(JSON.stringify({ event: 'gemini.deadline_abort', route, requestId, attempt, failureCategory: 'application_deadline', elapsedMs: Date.now() - startedAt }))
       controller.abort()
       reject(Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT', category: 'timeout' }))
     }, GEMINI_TIMEOUT_MS)
   })
   const operation = async () => {
     let response: globalThis.Response
-    let attempt = 0
     while (true) {
       attempt++
       stage = 'upstream_request'
@@ -91,7 +92,11 @@ export async function generate(prompt: string, schema: z.ZodTypeAny, route = 'un
           body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS } }), signal: controller.signal,
         })
       } catch {
-        if (controller.signal.aborted) throw Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT', category: 'timeout' })
+        if (controller.signal.aborted) {
+          console.error(JSON.stringify({ event: 'gemini.fetch_rejected', route, requestId, attempt, failureCategory: 'application_deadline', elapsedMs: Date.now() - startedAt }))
+          throw Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT', category: 'timeout' })
+        }
+        console.error(JSON.stringify({ event: 'gemini.fetch_rejected', route, requestId, attempt, failureCategory: 'network', elapsedMs: Date.now() - startedAt }))
         throw Object.assign(new Error('Provider network error'), { code: 'NETWORK', category: 'network' })
       }
       const responseAt = Date.now()
