@@ -20,7 +20,7 @@ Capture screenshots of the Overview, Plan an Event, Budget, Timeline, Vendor Che
 
 ## Architecture
 
-The React/TypeScript single-page app is built by Vite. Production requests use same-origin `/api/*` endpoints implemented as Vercel Node serverless functions. The Gemini key is read only by server code. The server calls Google's Gemini `generateContent` REST API with the stable `gemini-3.8-flash` model; Zod validates inputs and model output, and the browser never receives the key. There is no database or event persistence. Sample mode is an explicitly labelled local example.
+The React/TypeScript single-page app is built by Vite. Production requests use same-origin `/api/*` endpoints implemented as Vercel Node serverless functions. The Gemini key is read only by server code. The server calls Google's Gemini `generateContent` REST API with the stable `gemini-3.5-flash-lite` model; Zod validates inputs and model output, and the browser never receives the key. There is no database or event persistence. Sample mode is an explicitly labelled local example.
 
 ```text
 src/                 React views, planner logic, styles, tests

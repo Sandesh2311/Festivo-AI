@@ -25,7 +25,7 @@ export function guard(req: Request, res: Response): Input | null {
   if (!parsed.success) { res.status(400).json({ error: 'Please check your event details.' }); return null }
   return parsed.data
 }
-const GEMINI_MODEL = 'gemini-3.8-flash'
+const GEMINI_MODEL = 'gemini-3.5-flash-lite'
 const GEMINI_TIMEOUT_MS = 18_000
 const GEMINI_MAX_OUTPUT_TOKENS = 1000
 const GEMINI_MAX_RETRIES = 2

@@ -46,7 +46,7 @@ describe('Vercel plan route guards', () => {
     expect(state.code).toBe(200)
     expect((state.body as {plan:{summary:string}}).plan.summary).toContain('40 guest birthday')
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ method:'POST' })
-    expect(fetchMock.mock.calls[0][0]).toBe('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent')
+    expect(fetchMock.mock.calls[0][0]).toBe('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent')
     expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string).generationConfig).toEqual({ responseMimeType:'application/json', maxOutputTokens:1000 })
   })
   it('rejects requests larger than the server limit', async () => {
