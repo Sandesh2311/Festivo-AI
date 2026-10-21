@@ -28,7 +28,20 @@ export function guard(req: Request, res: Response): Input | null {
 const GEMINI_MODEL = 'gemini-3.8-flash'
 const GEMINI_TIMEOUT_MS = 18_000
 const GEMINI_MAX_OUTPUT_TOKENS = 1000
+const GEMINI_MAX_RETRIES = 2
+const GEMINI_RETRY_BASE_MS = 250
+const GEMINI_RETRY_MAX_MS = 2_000
+const GEMINI_MIN_ATTEMPT_WINDOW_MS = 1_000
 const ERROR_MESSAGE_LIMIT = 240
+
+function retryAfterMs(response: globalThis.Response): number | undefined {
+  const value = response.headers?.get('retry-after')?.trim()
+  if (!value) return undefined
+  const seconds = Number(value)
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : undefined
+  const date = Date.parse(value)
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined
+}
 
 function sanitizeProviderMessage(message: unknown, key: string, prompt: string): string | undefined {
   if (typeof message !== 'string') return undefined
@@ -65,21 +78,40 @@ export async function generate(prompt: string, schema: z.ZodTypeAny, route = 'un
     }, GEMINI_TIMEOUT_MS)
   })
   const operation = async () => {
-    stage = 'upstream_request'
     let response: globalThis.Response
-    const requestStartedAt = Date.now()
-    console.info(JSON.stringify({ event: 'gemini.request_start', route, requestId, elapsedMs: requestStartedAt - startedAt }))
-    try {
-      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS } }), signal: controller.signal,
-      })
-    } catch {
-      if (controller.signal.aborted) throw Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT', category: 'timeout' })
-      throw Object.assign(new Error('Provider network error'), { code: 'NETWORK', category: 'network' })
+    let attempt = 0
+    while (true) {
+      attempt++
+      stage = 'upstream_request'
+      const requestStartedAt = Date.now()
+      console.info(JSON.stringify({ event: 'gemini.request_start', route, requestId, attempt, elapsedMs: requestStartedAt - startedAt }))
+      try {
+        response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS } }), signal: controller.signal,
+        })
+      } catch {
+        if (controller.signal.aborted) throw Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT', category: 'timeout' })
+        throw Object.assign(new Error('Provider network error'), { code: 'NETWORK', category: 'network' })
+      }
+      const responseAt = Date.now()
+      console.info(JSON.stringify({ event: 'gemini.upstream_response', route, requestId, attempt, status: response.status, requestDurationMs: responseAt - requestStartedAt, elapsedMs: responseAt - startedAt }))
+      if (response.status !== 503) break
+
+      const remainingMs = GEMINI_TIMEOUT_MS - (Date.now() - startedAt)
+      const retryNumber = attempt
+      const exponentialMs = Math.min(GEMINI_RETRY_MAX_MS, GEMINI_RETRY_BASE_MS * (2 ** (retryNumber - 1)))
+      const jitteredMs = Math.round(exponentialMs * (0.5 + Math.random()))
+      const requestedWaitMs = retryAfterMs(response) ?? jitteredMs
+      const canRetry = attempt <= GEMINI_MAX_RETRIES && remainingMs > GEMINI_MIN_ATTEMPT_WINDOW_MS && requestedWaitMs <= remainingMs - GEMINI_MIN_ATTEMPT_WINDOW_MS
+      if (!canRetry) {
+        console.info(JSON.stringify({ event: 'gemini.retry_skipped', route, requestId, attempt, status: response.status, waitMs: 0, elapsedMs: Date.now() - startedAt, reason: attempt > GEMINI_MAX_RETRIES ? 'retry_limit' : 'deadline' }))
+        break
+      }
+      console.info(JSON.stringify({ event: 'gemini.retry', route, requestId, attempt, status: response.status, waitMs: requestedWaitMs, elapsedMs: Date.now() - startedAt }))
+      try { await response.body?.cancel() } catch { /* Ignore body cleanup errors before retrying. */ }
+      await new Promise<void>(resolve => setTimeout(resolve, requestedWaitMs))
     }
-    const responseAt = Date.now()
-    console.info(JSON.stringify({ event: 'gemini.upstream_response', route, requestId, status: response.status, requestDurationMs: responseAt - requestStartedAt, elapsedMs: responseAt - startedAt }))
     if (!response.ok) {
       let googleError: { error?: { code?: number | string; message?: string } } | undefined
       try { googleError = await response.json() as typeof googleError } catch { /* Google may return a non-JSON error body. */ }

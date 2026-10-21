@@ -12,6 +12,10 @@ function responseMock() {
   return { response: response as Response, state }
 }
 const body = { type:'Birthday',title:'Maya’s birthday',date:'2027-06-20',location:'Pune',guests:40,days:1,budget:20000,currency:'INR',flexibility:'Fixed',theme:'Garden picnic',setting:'Outdoor',food:'Vegetarian',personal:'',formality:'Relaxed',priority:'Budget',ageGroup:'Children',accessibility:'',special:'',contingency:'' }
+const successPayload = { candidates:[{ content:{ parts:[{ text:JSON.stringify({ summary:'Plan summary', concept:'Garden concept', theme:'Garden theme', venue:'Accessible venue', food:'Vegetarian food', guestExperience:'Simple games', contingency:'Indoor backup', suggestions:['Confirm venue','Check dietary needs'] }) }] } }] }
+function httpResponse(status: number, payload: unknown, retryAfter?: string) {
+  return { ok:status >= 200 && status < 300, status, headers:{ get: (name: string) => name.toLowerCase() === 'retry-after' ? retryAfter ?? null : null }, json:async () => payload } as unknown as Response
+}
 
 afterEach(() => { delete process.env.GEMINI_API_KEY; vi.unstubAllGlobals(); vi.useRealTimers(); vi.restoreAllMocks() })
 describe('Vercel plan route guards', () => {
@@ -79,7 +83,7 @@ describe('Vercel plan route guards', () => {
   })
   it('maps non-2xx Gemini responses to a safe upstream error', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'
-    const fetchMock = vi.fn().mockResolvedValue({ ok:false, status:503, json:async () => ({ error:{ code:503, message:'sensitive provider details' } }) })
+    const fetchMock = vi.fn().mockResolvedValue(httpResponse(500, { error:{ code:500, message:'sensitive provider details' } }))
     vi.stubGlobal('fetch', fetchMock)
     const timingLog = vi.spyOn(console, 'info').mockImplementation(() => {})
     const { response, state } = responseMock()
@@ -89,6 +93,72 @@ describe('Vercel plan route guards', () => {
     expect(JSON.stringify(state.body)).not.toContain('sensitive provider details')
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(timingLog.mock.calls)).toContain('gemini.upstream_response')
+  })
+  it('retries a 503 once and succeeds within the shared deadline', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(httpResponse(503, { error:{ code:503, message:'temporary overload' } }, '0.05'))
+      .mockResolvedValueOnce(httpResponse(200, successPayload))
+    vi.stubGlobal('fetch', fetchMock)
+    const timingLog = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const { response, state } = responseMock()
+    const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-retry-success'}, body } as Request, response)
+    await vi.advanceTimersByTimeAsync(50)
+    await pending
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(state.code).toBe(200)
+    const events = timingLog.mock.calls.map(call => String(call[0])).join('\n')
+    expect(events).toContain('"attempt":2')
+    expect(events).toContain('"status":503')
+    expect(events).toContain('"waitMs":50')
+    expect(events).not.toContain('test-only-key')
+    expect(events).not.toContain('Garden picnic')
+  })
+  it('stops after the configured retry limit for repeated 503 responses', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    const fetchMock = vi.fn().mockResolvedValue(httpResponse(503, { error:{ code:503, message:'temporary overload' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const timingLog = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const { response, state } = responseMock()
+    const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-retry-limit'}, body } as Request, response)
+    await vi.advanceTimersByTimeAsync(125)
+    await vi.advanceTimersByTimeAsync(250)
+    await pending
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(state.code).toBe(502)
+    const events = timingLog.mock.calls.map(call => String(call[0])).join('\n')
+    expect(events).toContain('"reason":"retry_limit"')
+    expect(events).toContain('"waitMs":125')
+    expect(events).toContain('"waitMs":250')
+  })
+  it('does not retry when the deadline cannot fit another useful attempt', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    vi.useFakeTimers()
+    let resolveFirst!: (value: Response) => void
+    const fetchMock = vi.fn(() => new Promise<Response>(resolve => { resolveFirst = resolve }))
+    vi.stubGlobal('fetch', fetchMock)
+    const timingLog = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const { response, state } = responseMock()
+    const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-retry-deadline'}, body } as Request, response)
+    await vi.advanceTimersByTimeAsync(17_000)
+    resolveFirst(httpResponse(503, { error:{ code:503, message:'temporary overload' } }))
+    await pending
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(state.code).toBe(502)
+    expect(timingLog.mock.calls.map(call => String(call[0])).join('\n')).toContain('"reason":"deadline"')
+  })
+  it.each([401, 403])('does not retry non-retryable HTTP %i responses', async status => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    const fetchMock = vi.fn().mockResolvedValue(httpResponse(status, { error:{ code:status, message:'not authorized' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { response, state } = responseMock()
+    await handler({ method:'POST', headers:{'x-forwarded-for':`test-no-retry-${status}`}, body } as Request, response)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(state.code).toBe(503)
   })
   it('handles a malformed Gemini HTTP response body safely', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'
