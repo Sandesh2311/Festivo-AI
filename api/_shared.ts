@@ -25,7 +25,8 @@ export function guard(req: Request, res: Response): Input | null {
   if (!parsed.success) { res.status(400).json({ error: 'Please check your event details.' }); return null }
   return parsed.data
 }
-const GEMINI_MODEL = 'gemini-3.5-flash-lite'
+const GEMINI_PRIMARY_MODEL = 'gemini-3.8-flash'
+const GEMINI_FALLBACK_MODEL = 'gemini-3.5-flash-lite'
 const GEMINI_TIMEOUT_MS = 18_000
 const GEMINI_MAX_OUTPUT_TOKENS = 1000
 const GEMINI_MAX_RETRIES = 2
@@ -69,53 +70,72 @@ export async function generate(prompt: string, schema: z.ZodTypeAny, route = 'un
   }
   let stage = 'request'
   let attempt = 0
+  let activeModel = GEMINI_PRIMARY_MODEL
   const controller = new AbortController()
   let timeout: ReturnType<typeof setTimeout> | undefined
-  console.info(JSON.stringify({ event: 'gemini.start', route, requestId, model: GEMINI_MODEL }))
+  console.info(JSON.stringify({ event: 'gemini.start', route, requestId, model: GEMINI_PRIMARY_MODEL, fallbackModel: GEMINI_FALLBACK_MODEL }))
   const timedOut = new Promise<never>((_, reject) => {
     timeout = setTimeout(() => {
-      console.error(JSON.stringify({ event: 'gemini.deadline_abort', route, requestId, attempt, failureCategory: 'application_deadline', elapsedMs: Date.now() - startedAt }))
+      console.error(JSON.stringify({ event: 'gemini.deadline_abort', route, requestId, attempt, model: activeModel, failureCategory: 'application_deadline', elapsedMs: Date.now() - startedAt }))
       controller.abort()
       reject(Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT', category: 'timeout' }))
     }, GEMINI_TIMEOUT_MS)
   })
   const operation = async () => {
-    let response: globalThis.Response
-    while (true) {
+    const requestModel = async (model: string, fallback = false): Promise<globalThis.Response> => {
       attempt++
+      activeModel = model
       stage = 'upstream_request'
       const requestStartedAt = Date.now()
-      console.info(JSON.stringify({ event: 'gemini.request_start', route, requestId, attempt, elapsedMs: requestStartedAt - startedAt }))
+      console.info(JSON.stringify({ event: 'gemini.request_start', route, requestId, attempt, model, fallback, elapsedMs: requestStartedAt - startedAt }))
+      let response: globalThis.Response
       try {
-        response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
+        response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
           method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
           body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS } }), signal: controller.signal,
         })
       } catch {
         if (controller.signal.aborted) {
-          console.error(JSON.stringify({ event: 'gemini.fetch_rejected', route, requestId, attempt, failureCategory: 'application_deadline', elapsedMs: Date.now() - startedAt }))
+          console.error(JSON.stringify({ event: 'gemini.fetch_rejected', route, requestId, attempt, model, failureCategory: 'application_deadline', elapsedMs: Date.now() - startedAt }))
           throw Object.assign(new Error('Provider timeout'), { code: 'TIMEOUT', category: 'timeout' })
         }
-        console.error(JSON.stringify({ event: 'gemini.fetch_rejected', route, requestId, attempt, failureCategory: 'network', elapsedMs: Date.now() - startedAt }))
+        console.error(JSON.stringify({ event: 'gemini.fetch_rejected', route, requestId, attempt, model, failureCategory: 'network', elapsedMs: Date.now() - startedAt }))
         throw Object.assign(new Error('Provider network error'), { code: 'NETWORK', category: 'network' })
       }
       const responseAt = Date.now()
-      console.info(JSON.stringify({ event: 'gemini.upstream_response', route, requestId, attempt, status: response.status, requestDurationMs: responseAt - requestStartedAt, elapsedMs: responseAt - startedAt }))
-      if (response.status !== 503) break
+      console.info(JSON.stringify({ event: 'gemini.upstream_response', route, requestId, attempt, model, fallback, status: response.status, requestDurationMs: responseAt - requestStartedAt, elapsedMs: responseAt - startedAt }))
+      return response
+    }
 
+    let primaryAttempts = 1
+    let response = await requestModel(GEMINI_PRIMARY_MODEL)
+    while (response.status === 503) {
       const remainingMs = GEMINI_TIMEOUT_MS - (Date.now() - startedAt)
-      const retryNumber = attempt
+      const retryNumber = primaryAttempts
       const exponentialMs = Math.min(GEMINI_RETRY_MAX_MS, GEMINI_RETRY_BASE_MS * (2 ** (retryNumber - 1)))
       const jitteredMs = Math.round(exponentialMs * (0.5 + Math.random()))
       const requestedWaitMs = retryAfterMs(response) ?? jitteredMs
-      const canRetry = attempt <= GEMINI_MAX_RETRIES && remainingMs > GEMINI_MIN_ATTEMPT_WINDOW_MS && requestedWaitMs <= remainingMs - GEMINI_MIN_ATTEMPT_WINDOW_MS
+      const canRetry = primaryAttempts <= GEMINI_MAX_RETRIES && remainingMs > GEMINI_MIN_ATTEMPT_WINDOW_MS && requestedWaitMs <= remainingMs - GEMINI_MIN_ATTEMPT_WINDOW_MS
       if (!canRetry) {
-        console.info(JSON.stringify({ event: 'gemini.retry_skipped', route, requestId, attempt, status: response.status, waitMs: 0, elapsedMs: Date.now() - startedAt, reason: attempt > GEMINI_MAX_RETRIES ? 'retry_limit' : 'deadline' }))
+        console.info(JSON.stringify({ event: 'gemini.retry_skipped', route, requestId, attempt, model: GEMINI_PRIMARY_MODEL, status: response.status, waitMs: 0, elapsedMs: Date.now() - startedAt, reason: primaryAttempts > GEMINI_MAX_RETRIES ? 'retry_limit' : 'deadline' }))
         break
       }
-      console.info(JSON.stringify({ event: 'gemini.retry', route, requestId, attempt, status: response.status, waitMs: requestedWaitMs, elapsedMs: Date.now() - startedAt }))
+      console.info(JSON.stringify({ event: 'gemini.retry', route, requestId, attempt, model: GEMINI_PRIMARY_MODEL, status: response.status, waitMs: requestedWaitMs, elapsedMs: Date.now() - startedAt }))
       try { await response.body?.cancel() } catch { /* Ignore body cleanup errors before retrying. */ }
       await new Promise<void>(resolve => setTimeout(resolve, requestedWaitMs))
+      primaryAttempts++
+      response = await requestModel(GEMINI_PRIMARY_MODEL)
+    }
+
+    if (response.status === 503) {
+      const remainingMs = GEMINI_TIMEOUT_MS - (Date.now() - startedAt)
+      if (remainingMs > GEMINI_MIN_ATTEMPT_WINDOW_MS) {
+        console.info(JSON.stringify({ event: 'gemini.fallback', route, requestId, fromModel: GEMINI_PRIMARY_MODEL, model: GEMINI_FALLBACK_MODEL, remainingMs, elapsedMs: Date.now() - startedAt }))
+        try { await response.body?.cancel() } catch { /* Ignore body cleanup errors before falling back. */ }
+        response = await requestModel(GEMINI_FALLBACK_MODEL, true)
+      } else {
+        console.info(JSON.stringify({ event: 'gemini.fallback_skipped', route, requestId, fromModel: GEMINI_PRIMARY_MODEL, model: GEMINI_FALLBACK_MODEL, remainingMs, reason: 'deadline', elapsedMs: Date.now() - startedAt }))
+      }
     }
     if (!response.ok) {
       let googleError: { error?: { code?: number | string; message?: string } } | undefined
@@ -156,7 +176,7 @@ export async function generate(prompt: string, schema: z.ZodTypeAny, route = 'un
   } catch (error) {
     const details = error as { code?: string; category?: string; status?: number; googleCode?: number | string; googleMessage?: string }
     const category = details?.category || 'unexpected'
-    console.error(JSON.stringify({ event: 'gemini.failure', route, requestId, stage, category, code: details?.code, status: details?.status, googleCode: details?.googleCode, googleMessage: details?.googleMessage, totalDurationMs: Date.now() - startedAt }))
+    console.error(JSON.stringify({ event: 'gemini.failure', route, requestId, stage, model: activeModel, category, code: details?.code, status: details?.status, googleCode: details?.googleCode, googleMessage: details?.googleMessage, totalDurationMs: Date.now() - startedAt }))
     throw error
   } finally { if (timeout) clearTimeout(timeout) }
 }

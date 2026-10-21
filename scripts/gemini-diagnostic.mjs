@@ -1,6 +1,6 @@
 /* global process, performance, console, Headers, AbortController, setTimeout, fetch, clearTimeout */
 
-const model = 'gemini-3.5-flash-lite'
+const model = 'gemini-3.8-flash'
 const prompt = 'Return JSON only: {"ok":true}'
 const timeoutMs = 8_000
 const rawKey = process.env.GEMINI_API_KEY

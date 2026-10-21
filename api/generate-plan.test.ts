@@ -46,7 +46,7 @@ describe('Vercel plan route guards', () => {
     expect(state.code).toBe(200)
     expect((state.body as {plan:{summary:string}}).plan.summary).toContain('40 guest birthday')
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ method:'POST' })
-    expect(fetchMock.mock.calls[0][0]).toBe('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent')
+    expect(fetchMock.mock.calls[0][0]).toBe('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent')
     expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string).generationConfig).toEqual({ responseMimeType:'application/json', maxOutputTokens:1000 })
   })
   it('rejects requests larger than the server limit', async () => {
@@ -99,7 +99,7 @@ describe('Vercel plan route guards', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(timingLog.mock.calls)).toContain('gemini.upstream_response')
   })
-  it('retries a 503 once and succeeds within the shared deadline', async () => {
+  it('retries a primary 503 once and succeeds on the primary within the shared deadline', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'
     vi.useFakeTimers()
     vi.spyOn(Math, 'random').mockReturnValue(0)
@@ -121,25 +121,102 @@ describe('Vercel plan route guards', () => {
     expect(events).not.toContain('test-only-key')
     expect(events).not.toContain('Garden picnic')
   })
+  it('uses the fallback after exhausting primary 503 retries and validates its plan', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(httpResponse(503, { error:{ code:503, message:'temporary overload' } }, '0'))
+      .mockResolvedValueOnce(httpResponse(503, { error:{ code:503, message:'temporary overload' } }, '0'))
+      .mockResolvedValueOnce(httpResponse(503, { error:{ code:503, message:'temporary overload' } }, '0'))
+      .mockResolvedValueOnce(httpResponse(200, successPayload))
+    vi.stubGlobal('fetch', fetchMock)
+    const timingLog = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const { response, state } = responseMock()
+    const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-fallback-success'}, body } as Request, response)
+    await vi.advanceTimersByTimeAsync(10)
+    await pending
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(fetchMock.mock.calls.map(call => call[0])).toEqual([
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent',
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent',
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent',
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent',
+    ])
+    expect(state.code).toBe(200)
+    expect((state.body as { plan:{ summary:string } }).plan.summary).toBe('Plan summary')
+    expect(timingLog.mock.calls.map(call => String(call[0])).join('\n')).toContain('"fallback":true')
+  })
   it('stops after the configured retry limit for repeated 503 responses', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'
     vi.useFakeTimers()
     vi.spyOn(Math, 'random').mockReturnValue(0)
-    const fetchMock = vi.fn().mockResolvedValue(httpResponse(503, { error:{ code:503, message:'temporary overload' } }))
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(httpResponse(503, { error:{ code:503, message:'temporary overload' } }, '0'))
+      .mockResolvedValueOnce(httpResponse(503, { error:{ code:503, message:'temporary overload' } }, '0'))
+      .mockResolvedValueOnce(httpResponse(503, { error:{ code:503, message:'temporary overload' } }, '0'))
+      .mockResolvedValueOnce(httpResponse(503, { error:{ code:503, message:'fallback overload' } }))
     vi.stubGlobal('fetch', fetchMock)
     const timingLog = vi.spyOn(console, 'info').mockImplementation(() => {})
     const { response, state } = responseMock()
     const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-retry-limit'}, body } as Request, response)
-    await vi.advanceTimersByTimeAsync(125)
-    await vi.advanceTimersByTimeAsync(250)
+    await vi.advanceTimersByTimeAsync(10)
     await pending
-    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
     expect(state.code).toBe(503)
     expect(state.body).toEqual({ error:'The planning assistant is temporarily unavailable. Please try again shortly.' })
     const events = timingLog.mock.calls.map(call => String(call[0])).join('\n')
     expect(events).toContain('"reason":"retry_limit"')
-    expect(events).toContain('"waitMs":125')
-    expect(events).toContain('"waitMs":250')
+    expect(events).toContain('"waitMs":0')
+    expect(events).toContain('"fallback":true')
+  })
+  it('does not use fallback for authentication failures', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    const fetchMock = vi.fn().mockResolvedValue(httpResponse(401, { error:{ code:401, message:'not authorized' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { response, state } = responseMock()
+    await handler({ method:'POST', headers:{'x-forwarded-for':'test-auth-no-fallback'}, body } as Request, response)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0][0]).toContain('gemini-3.8-flash:')
+    expect(state.code).toBe(503)
+  })
+  it('rejects malformed fallback output using the existing plan validation', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(httpResponse(503, {}, '0'))
+      .mockResolvedValueOnce(httpResponse(503, {}, '0'))
+      .mockResolvedValueOnce(httpResponse(503, {}, '0'))
+      .mockResolvedValueOnce(httpResponse(200, { candidates:[{ content:{ parts:[{ text:'not json' }] } }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { response, state } = responseMock()
+    const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-fallback-malformed'}, body } as Request, response)
+    await vi.advanceTimersByTimeAsync(10)
+    await pending
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(state.code).toBe(502)
+    expect(state.body).toEqual({ error:'The planning assistant returned an invalid answer. Please try again.' })
+  })
+  it('keeps the original deadline while the fallback request is in flight', async () => {
+    process.env.GEMINI_API_KEY = 'test-only-key'
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(httpResponse(503, {}, '0'))
+      .mockResolvedValueOnce(httpResponse(503, {}, '0'))
+      .mockResolvedValueOnce(httpResponse(503, {}, '0'))
+      .mockImplementationOnce((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once:true })
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { response, state } = responseMock()
+    const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-fallback-deadline'}, body } as Request, response)
+    await vi.advanceTimersByTimeAsync(18_000)
+    await pending
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect((fetchMock.mock.calls[3][1] as RequestInit).signal?.aborted).toBe(true)
+    expect(state.code).toBe(504)
   })
   it('does not retry when the deadline cannot fit another useful attempt', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'
