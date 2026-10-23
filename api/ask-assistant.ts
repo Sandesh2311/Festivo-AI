@@ -5,7 +5,7 @@ const outputSchema = z.object({ answer: z.string().min(20).max(1500) })
 export default async function handler(req: Request, res: Response) {
   res.setHeader('Cache-Control','no-store'); res.setHeader('X-Content-Type-Options','nosniff')
   if (req.method !== 'POST') { res.status(405).json({ error: 'Method not allowed' }); return }
-  let size = 0; try { size = JSON.stringify(req.body ?? {}).length } catch { res.status(400).json({ error: 'Invalid request' }); return }
+  let size = 0; try { size = Buffer.byteLength(JSON.stringify(req.body ?? {}) ?? '', 'utf8') } catch { res.status(400).json({ error: 'Invalid request' }); return }
   if (size > 12000) { res.status(413).json({ error: 'Request is too large' }); return }
   if (!allowRate(req, res)) return
   const parsed = inputSchema.safeParse(req.body)

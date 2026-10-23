@@ -16,7 +16,18 @@ Festivo AI is a practical event-planning assistant for weddings, birthdays, enga
 
 ## Screenshots
 
-Capture screenshots of the Overview, Plan an Event, Budget, Timeline, Vendor Checklist and Inspiration views here before a public release.
+### Overview
+![Festivo AI overview](screenshots/overview.png)
+
+### Plan an Event
+![Event planning form](screenshots/event-form.png)
+
+### Budget and Generated Plan
+![Budget and generated plan](screenshots/budget-plan.png)
+
+### Timeline and Vendor Checklist
+![Timeline and vendor checklist](screenshots/timeline.png)
+
 
 ## Architecture
 

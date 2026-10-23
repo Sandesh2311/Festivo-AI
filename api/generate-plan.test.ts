@@ -54,6 +54,13 @@ describe('Vercel plan route guards', () => {
     await handler({ method:'POST', headers:{}, body:{ ...body, special:'x'.repeat(13000) } }, response)
     expect(state.code).toBe(413)
   })
+  it('counts UTF-8 bytes when enforcing the request size limit', async () => {
+    const oversizedUnicodeBody = { ...body, special:'é'.repeat(6000) }
+    expect(JSON.stringify(oversizedUnicodeBody).length).toBeLessThan(12000)
+    const { response, state } = responseMock()
+    await handler({ method:'POST', headers:{}, body:oversizedUnicodeBody }, response)
+    expect(state.code).toBe(413)
+  })
   it('returns a safe error for invalid model JSON', async () => {
     process.env.GEMINI_API_KEY = 'test-only-key'
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok:true, json:async () => ({ candidates:[{ content:{ parts:[{ text:'not json' }] } }] }) }))

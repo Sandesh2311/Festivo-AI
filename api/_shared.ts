@@ -19,7 +19,7 @@ export function guard(req: Request, res: Response): Input | null {
   if (req.method !== 'POST') { res.status(405).json({ error: 'Method not allowed' }); return null }
   let body: string
   try { body = JSON.stringify(req.body ?? {}) } catch { res.status(400).json({ error: 'Invalid request' }); return null }
-  if (body.length > 12000) { res.status(413).json({ error: 'Request is too large' }); return null }
+  if (Buffer.byteLength(body, 'utf8') > 12000) { res.status(413).json({ error: 'Request is too large' }); return null }
   if (!allowRate(req, res)) return null
   const parsed = eventSchema.safeParse(req.body)
   if (!parsed.success) { res.status(400).json({ error: 'Please check your event details.' }); return null }
