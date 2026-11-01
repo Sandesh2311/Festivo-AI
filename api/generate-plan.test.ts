@@ -73,7 +73,7 @@ describe('Vercel plan route guards', () => {
     const timingLog = vi.spyOn(console, 'info').mockImplementation(() => {})
     const { response, state } = responseMock()
     const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-timeout'}, body } as Request, response)
-    await vi.advanceTimersByTimeAsync(18_000)
+    await vi.advanceTimersByTimeAsync(22_000)
     await pending
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect((fetchMock.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true)
@@ -150,7 +150,7 @@ describe('Vercel plan route guards', () => {
     const timingLog = vi.spyOn(console, 'info').mockImplementation(() => {})
     const { response, state } = responseMock()
     const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-retry-deadline'}, body } as Request, response)
-    await vi.advanceTimersByTimeAsync(17_000)
+    await vi.advanceTimersByTimeAsync(21_500)
     resolveFirst(httpResponse(503, { error:{ code:503, message:'temporary overload' } }))
     await pending
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -170,13 +170,13 @@ describe('Vercel plan route guards', () => {
     const { response, state } = responseMock()
     const pending = handler({ method:'POST', headers:{'x-forwarded-for':'test-retry-total-deadline'}, body } as Request, response)
     await vi.advanceTimersByTimeAsync(17_000)
-    await vi.advanceTimersByTimeAsync(1_000)
+    await vi.advanceTimersByTimeAsync(5_000)
     await pending
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect((fetchMock.mock.calls[1][1] as RequestInit).signal?.aborted).toBe(true)
     expect(state.code).toBe(504)
     const deadlineEvent = log.mock.calls.map(call => JSON.parse(String(call[0]))).find(event => event.event === 'gemini.deadline_abort')
-    expect(deadlineEvent).toMatchObject({ attempt:2, failureCategory:'application_deadline', elapsedMs:18_000 })
+    expect(deadlineEvent).toMatchObject({ attempt:2, failureCategory:'application_deadline', elapsedMs:22_000 })
   })
   it.each([401, 403])('does not retry non-retryable HTTP %i responses', async status => {
     process.env.GEMINI_API_KEY = 'test-only-key'

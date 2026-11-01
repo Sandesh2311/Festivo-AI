@@ -26,7 +26,7 @@ export function guard(req: Request, res: Response): Input | null {
   return parsed.data
 }
 const GEMINI_MODEL = 'gemini-3.5-flash-lite'
-const GEMINI_TIMEOUT_MS = 18_000
+const GEMINI_TIMEOUT_MS = 22_000
 const GEMINI_MAX_OUTPUT_TOKENS = 1000
 const GEMINI_MAX_RETRIES = 2
 const GEMINI_RETRY_BASE_MS = 250
